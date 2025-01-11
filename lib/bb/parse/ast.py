@@ -43,6 +43,21 @@ class IncludeNode(AstNode):
         else:
             bb.parse.ConfHandler.include(self.filename, s, self.lineno, data, False)
 
+class IncludeAllNode(AstNode):
+    def __init__(self, filename, lineno, what_file):
+        AstNode.__init__(self, filename, lineno)
+        self.what_file = what_file
+
+    def eval(self, data):
+        """
+        Include the file and evaluate the statements
+        """
+        s = data.expand(self.what_file)
+        logger.debug2("CONF %s:%s: including %s", self.filename, self.lineno, s)
+
+        for path in data.getVar("BBPATH").split(":"):
+            bb.parse.ConfHandler.include(self.filename, os.path.join(path, s), self.lineno, data, False)
+
 class ExportNode(AstNode):
     def __init__(self, filename, lineno, var):
         AstNode.__init__(self, filename, lineno)
@@ -240,14 +255,16 @@ class ExportFuncsNode(AstNode):
                 data.setVar(func, sentinel + "    " + calledfunc + "\n", parsing=True)
 
 class AddTaskNode(AstNode):
-    def __init__(self, filename, lineno, func, before, after):
+    def __init__(self, filename, lineno, tasks, before, after):
         AstNode.__init__(self, filename, lineno)
-        self.func = func
+        self.tasks = tasks
         self.before = before
         self.after = after
 
     def eval(self, data):
-        bb.build.addtask(self.func, self.before, self.after, data)
+        tasks = self.tasks.split()
+        for task in tasks:
+            bb.build.addtask(task, self.before, self.after, data)
 
 class DelTaskNode(AstNode):
     def __init__(self, filename, lineno, tasks):
@@ -324,8 +341,48 @@ class InheritDeferredNode(AstNode):
         inherits.append(self.inherit)
         data.setVar('__BBDEFINHERITS', inherits)
 
+class AddFragmentsNode(AstNode):
+    def __init__(self, filename, lineno, fragments_path_prefix, fragments_variable, flagged_variables_list_variable):
+        AstNode.__init__(self, filename, lineno)
+        self.fragments_path_prefix = fragments_path_prefix
+        self.fragments_variable = fragments_variable
+        self.flagged_variables_list_variable = flagged_variables_list_variable
+
+    def eval(self, data):
+        # No need to use mark_dependency since we would only match a fragment
+        # from a specific layer and there can only be a single layer with a
+        # given namespace.
+        def find_fragment(layers, layerid, full_fragment_name):
+           for layerpath in layers.split():
+               candidate_fragment_path = os.path.join(layerpath, full_fragment_name)
+               if os.path.exists(candidate_fragment_path) and bb.utils.get_file_layer(candidate_fragment_path, data) == layerid:
+                   return candidate_fragment_path
+           return None
+
+        fragments = data.getVar(self.fragments_variable)
+        layers = data.getVar('BBLAYERS')
+        flagged_variables = data.getVar(self.flagged_variables_list_variable).split()
+
+        if not fragments:
+            return
+        for f in fragments.split():
+            layerid, fragment_name = f.split('/', 1)
+            full_fragment_name = data.expand("{}/{}.conf".format(self.fragments_path_prefix, fragment_name))
+            fragment_path = find_fragment(layers, layerid, full_fragment_name)
+            if fragment_path:
+                bb.parse.ConfHandler.include(self.filename, fragment_path, self.lineno, data, "include fragment")
+                for flagged_var in flagged_variables:
+                    val = data.getVar(flagged_var)
+                    data.setVarFlag(flagged_var, f, val)
+                    data.setVar(flagged_var, None)
+            else:
+                bb.error("Could not find fragment {} in enabled layers: {}".format(f, layers))
+
 def handleInclude(statements, filename, lineno, m, force):
     statements.append(IncludeNode(filename, lineno, m.group(1), force))
+
+def handleIncludeAll(statements, filename, lineno, m):
+    statements.append(IncludeAllNode(filename, lineno, m.group(1)))
 
 def handleExport(statements, filename, lineno, m):
     statements.append(ExportNode(filename, lineno, m.group(1)))
@@ -348,21 +405,11 @@ def handlePythonMethod(statements, filename, lineno, funcname, modulename, body)
 def handleExportFuncs(statements, filename, lineno, m, classname):
     statements.append(ExportFuncsNode(filename, lineno, m.group(1), classname))
 
-def handleAddTask(statements, filename, lineno, m):
-    func = m.group("func")
-    before = m.group("before")
-    after = m.group("after")
-    if func is None:
-        return
+def handleAddTask(statements, filename, lineno, tasks, before, after):
+    statements.append(AddTaskNode(filename, lineno, tasks, before, after))
 
-    statements.append(AddTaskNode(filename, lineno, func, before, after))
-
-def handleDelTask(statements, filename, lineno, m):
-    func = m.group(1)
-    if func is None:
-        return
-
-    statements.append(DelTaskNode(filename, lineno, func))
+def handleDelTask(statements, filename, lineno, tasks):
+    statements.append(DelTaskNode(filename, lineno, tasks))
 
 def handleBBHandlers(statements, filename, lineno, m):
     statements.append(BBHandlerNode(filename, lineno, m.group(1)))
@@ -377,6 +424,12 @@ def handleInherit(statements, filename, lineno, m):
 def handleInheritDeferred(statements, filename, lineno, m):
     classes = m.group(1)
     statements.append(InheritDeferredNode(filename, lineno, classes))
+
+def handleAddFragments(statements, filename, lineno, m):
+    fragments_path_prefix = m.group(1)
+    fragments_variable = m.group(2)
+    flagged_variables_list_variable = m.group(3)
+    statements.append(AddFragmentsNode(filename, lineno, fragments_path_prefix, fragments_variable, flagged_variables_list_variable))
 
 def runAnonFuncs(d):
     code = []
