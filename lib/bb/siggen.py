@@ -15,6 +15,7 @@ import difflib
 import simplediff
 import json
 import types
+from contextlib import contextmanager
 import bb.compress.zstd
 from bb.checksum import FileChecksumCache
 from bb import runqueue
@@ -27,6 +28,14 @@ hashequiv_logger = logging.getLogger('BitBake.SigGen.HashEquiv')
 #find_siginfo and find_siginfo_version are set by the metadata siggen
 # The minimum version of the find_siginfo function we need
 find_siginfo_minversion = 2
+
+HASHSERV_ENVVARS = [
+    "SSL_CERT_DIR",
+    "SSL_CERT_FILE",
+    "NO_PROXY",
+    "HTTPS_PROXY",
+    "HTTP_PROXY"
+]
 
 def check_siggen_version(siggen):
     if not hasattr(siggen, "find_siginfo_version"):
@@ -190,9 +199,6 @@ class SignatureGenerator(object):
         self.taskhash, self.unihash, self.unitaskhashes, self.tidtopn = hashes
 
     def save_unitaskhashes(self):
-        return
-
-    def copy_unitaskhashes(self, targetdir):
         return
 
     def set_setscene_tasks(self, setscene_tasks):
@@ -372,7 +378,7 @@ class SignatureGeneratorBasic(SignatureGenerator):
             self.taints[tid] = taint
             logger.warning("%s is tainted from a forced run" % tid)
 
-        return
+        return set(dep for _, dep in self.runtaskdeps[tid])
 
     def get_taskhash(self, tid, deps, dataCaches):
 
@@ -408,9 +414,6 @@ class SignatureGeneratorBasic(SignatureGenerator):
 
     def save_unitaskhashes(self):
         self.unihash_cache.save(self.unitaskhashes)
-
-    def copy_unitaskhashes(self, targetdir):
-        self.unihash_cache.copyfile(targetdir)
 
     def dump_sigtask(self, mcfn, task, stampbase, runtime):
         tid = mcfn + ":" + task
@@ -531,19 +534,28 @@ class SignatureGeneratorUniHashMixIn(object):
     def __init__(self, data):
         self.extramethod = {}
         # NOTE: The cache only tracks hashes that exist. Hashes that don't
-        # exist are always queries from the server since it is possible for
+        # exist are always queried from the server since it is possible for
         # hashes to appear over time, but much less likely for them to
         # disappear
         self.unihash_exists_cache = set()
         self.username = None
         self.password = None
+        self.env = {}
+
+        origenv = data.getVar("BB_ORIGENV")
+        for e in HASHSERV_ENVVARS:
+            value = data.getVar(e)
+            if not value and origenv:
+                value = origenv.getVar(e)
+            if value:
+                self.env[e] = value
         super().__init__(data)
 
     def get_taskdata(self):
-        return (self.server, self.method, self.extramethod, self.max_parallel, self.username, self.password) + super().get_taskdata()
+        return (self.server, self.method, self.extramethod, self.username, self.password, self.env) + super().get_taskdata()
 
     def set_taskdata(self, data):
-        self.server, self.method, self.extramethod, self.max_parallel, self.username, self.password = data[:6]
+        self.server, self.method, self.extramethod, self.username, self.password, self.env = data[:6]
         super().set_taskdata(data[6:])
 
     def get_hashserv_creds(self):
@@ -555,15 +567,27 @@ class SignatureGeneratorUniHashMixIn(object):
 
         return {}
 
-    def client(self):
-        if getattr(self, '_client', None) is None:
-            self._client = hashserv.create_client(self.server, **self.get_hashserv_creds())
-        return self._client
+    @contextmanager
+    def _client_env(self):
+        orig_env = os.environ.copy()
+        try:
+            for k, v in self.env.items():
+                os.environ[k] = v
 
-    def client_pool(self):
-        if getattr(self, '_client_pool', None) is None:
-            self._client_pool = hashserv.client.ClientPool(self.server, self.max_parallel, **self.get_hashserv_creds())
-        return self._client_pool
+            yield
+        finally:
+            for k, v in self.env.items():
+                if k in orig_env:
+                    os.environ[k] = orig_env[k]
+                else:
+                    del os.environ[k]
+
+    @contextmanager
+    def client(self):
+        with self._client_env():
+            if getattr(self, '_client', None) is None:
+                self._client = hashserv.create_client(self.server, **self.get_hashserv_creds())
+            yield self._client
 
     def reset(self, data):
         self.__close_clients()
@@ -574,12 +598,13 @@ class SignatureGeneratorUniHashMixIn(object):
         return super().exit()
 
     def __close_clients(self):
-        if getattr(self, '_client', None) is not None:
-            self._client.close()
-            self._client = None
-        if getattr(self, '_client_pool', None) is not None:
-            self._client_pool.close()
-            self._client_pool = None
+        with self._client_env():
+            if getattr(self, '_client', None) is not None:
+                self._client.close()
+                self._client = None
+            if getattr(self, '_client_pool', None) is not None:
+                self._client_pool.close()
+                self._client_pool = None
 
     def get_stampfile_hash(self, tid):
         if tid in self.taskhash:
@@ -640,23 +665,20 @@ class SignatureGeneratorUniHashMixIn(object):
         if len(query) == 0:
             return {}
 
-        uncached_query = {}
+        query_keys = []
         result = {}
         for key, unihash in query.items():
             if unihash in self.unihash_exists_cache:
                 result[key] = True
             else:
-                uncached_query[key] = unihash
+                query_keys.append(key)
 
-        if self.max_parallel <= 1 or len(uncached_query) <= 1:
-            # No parallelism required. Make the query serially with the single client
-            uncached_result = {
-                key: self.client().unihash_exists(value) for key, value in uncached_query.items()
-            }
-        else:
-            uncached_result = self.client_pool().unihashes_exist(uncached_query)
+        if query_keys:
+            with self.client() as client:
+                query_result = client.unihash_exists_batch(query[k] for k in query_keys)
 
-        for key, exists in uncached_result.items():
+        for idx, key in enumerate(query_keys):
+            exists = query_result[idx]
             if exists:
                 self.unihash_exists_cache.add(query[key])
             result[key] = exists
@@ -672,27 +694,24 @@ class SignatureGeneratorUniHashMixIn(object):
         unihash
         """
         result = {}
-        queries = {}
-        query_result = {}
+        query_tids = []
 
         for tid in tids:
             unihash = self.get_cached_unihash(tid)
             if unihash:
                 result[tid] = unihash
             else:
-                queries[tid] = (self._get_method(tid), self.taskhash[tid])
+                query_tids.append(tid)
 
-        if len(queries) == 0:
-            return result
+        if query_tids:
+            unihashes = []
+            try:
+                with self.client() as client:
+                    unihashes = client.get_unihash_batch((self._get_method(tid), self.taskhash[tid]) for tid in query_tids)
+            except (ConnectionError, FileNotFoundError) as e:
+                bb.warn('Error contacting Hash Equivalence Server %s: %s' % (self.server, str(e)))
 
-        if self.max_parallel <= 1 or len(queries) <= 1:
-            # No parallelism required. Make the query serially with the single client
-            for tid, args in queries.items():
-                query_result[tid] = self.client().get_unihash(*args)
-        else:
-            query_result = self.client_pool().get_unihashes(queries)
-
-        for tid, unihash in query_result.items():
+        for idx, tid in enumerate(query_tids):
             # In the absence of being able to discover a unique hash from the
             # server, make it be equivalent to the taskhash. The unique "hash" only
             # really needs to be a unique string (not even necessarily a hash), but
@@ -707,7 +726,9 @@ class SignatureGeneratorUniHashMixIn(object):
             #    to the server, there is a better chance that they will agree on
             #    the unique hash.
             taskhash = self.taskhash[tid]
-            if unihash:
+
+            if unihashes and unihashes[idx]:
+                unihash = unihashes[idx]
                 # A unique hash equal to the taskhash is not very interesting,
                 # so it is reported it at debug level 2. If they differ, that
                 # is much more interesting, so it is reported at debug level 1
@@ -715,7 +736,6 @@ class SignatureGeneratorUniHashMixIn(object):
             else:
                 hashequiv_logger.debug2('No reported unihash for %s:%s from %s' % (tid, taskhash, self.server))
                 unihash = taskhash
-
 
             self.set_unihash(tid, unihash)
             self.unihash[tid] = unihash
@@ -785,7 +805,9 @@ class SignatureGeneratorUniHashMixIn(object):
                 if tid in self.extramethod:
                     method = method + self.extramethod[tid]
 
-                data = self.client().report_unihash(taskhash, method, outhash, unihash, extra_data)
+                with self.client() as client:
+                    data = client.report_unihash(taskhash, method, outhash, unihash, extra_data)
+
                 new_unihash = data['unihash']
 
                 if new_unihash != unihash:
@@ -795,7 +817,7 @@ class SignatureGeneratorUniHashMixIn(object):
                     d.setVar('BB_UNIHASH', new_unihash)
                 else:
                     hashequiv_logger.debug('Reported task %s as unihash %s to %s' % (taskhash, unihash, self.server))
-            except ConnectionError as e:
+            except (ConnectionError, FileNotFoundError) as e:
                 bb.warn('Error contacting Hash Equivalence Server %s: %s' % (self.server, str(e)))
         finally:
             if sigfile:
@@ -816,7 +838,9 @@ class SignatureGeneratorUniHashMixIn(object):
             if tid in self.extramethod:
                 method = method + self.extramethod[tid]
 
-            data = self.client().report_unihash_equiv(taskhash, method, wanted_unihash, extra_data)
+            with self.client() as client:
+                data = client.report_unihash_equiv(taskhash, method, wanted_unihash, extra_data)
+
             hashequiv_logger.verbose('Reported task %s as unihash %s to %s (%s)' % (tid, wanted_unihash, self.server, str(data)))
 
             if data is None:
@@ -835,7 +859,7 @@ class SignatureGeneratorUniHashMixIn(object):
                 # TODO: What to do here?
                 hashequiv_logger.verbose('Task %s unihash reported as unwanted hash %s' % (tid, finalunihash))
 
-        except ConnectionError as e:
+        except (ConnectionError, FileNotFoundError) as e:
             bb.warn('Error contacting Hash Equivalence Server %s: %s' % (self.server, str(e)))
 
         return False
@@ -849,13 +873,12 @@ class SignatureGeneratorTestEquivHash(SignatureGeneratorUniHashMixIn, SignatureG
         super().init_rundepcheck(data)
         self.server = data.getVar('BB_HASHSERVE')
         self.method = "sstate_output_hash"
-        self.max_parallel = 1
 
 def clean_checksum_file_path(file_checksum_tuple):
     f, cs = file_checksum_tuple
     if "/./" in f:
         return "./" + f.split("/./")[1]
-    return f
+    return os.path.basename(f)
 
 def dump_this_task(outfile, d):
     import bb.parse

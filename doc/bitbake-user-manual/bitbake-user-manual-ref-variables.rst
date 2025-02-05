@@ -127,18 +127,6 @@ overview of their function and contents.
       Contains the name of the currently running task. The name does not
       include the ``do_`` prefix.
 
-   :term:`BB_DANGLINGAPPENDS_WARNONLY`
-      Defines how BitBake handles situations where an append file
-      (``.bbappend``) has no corresponding recipe file (``.bb``). This
-      condition often occurs when layers get out of sync (e.g. ``oe-core``
-      bumps a recipe version and the old recipe no longer exists and the
-      other layer has not been updated to the new version of the recipe
-      yet).
-
-      The default fatal behavior is safest because it is the sane reaction
-      given something is out of sync. It is important to realize when your
-      changes are no longer being applied.
-
    :term:`BB_DEFAULT_TASK`
       The default task to use when none is specified (e.g. with the ``-c``
       command line option). The task name specified should not include the
@@ -424,13 +412,22 @@ overview of their function and contents.
 
       Example usage::
 
-         BB_HASHSERVE_UPSTREAM = "hashserv.yocto.io:8687"
+         BB_HASHSERVE_UPSTREAM = "hashserv.yoctoproject.org:8686"
 
    :term:`BB_INVALIDCONF`
       Used in combination with the ``ConfigParsed`` event to trigger
       re-parsing the base metadata (i.e. all the recipes). The
       ``ConfigParsed`` event can set the variable to trigger the re-parse.
       You must be careful to avoid recursive loops with this functionality.
+
+   :term:`BB_LOADFACTOR_MAX`
+      Setting this to a value will cause BitBake to check the system load
+      average before executing new tasks. If the load average is above the
+      the number of CPUs multipled by this factor, no new task will be started
+      unless there is no task executing. A value of "1.5" has been found to
+      work reasonably. This is helpful for systems which don't have pressure
+      regulation enabled, which is more granular. Pressure values take
+      precedence over loadfactor.
 
    :term:`BB_LOGCONFIG`
       Specifies the name of a config file that contains the user logging
@@ -757,6 +754,10 @@ overview of their function and contents.
    :term:`BBFILE_PRIORITY`
       Assigns the priority for recipe files in each layer.
 
+      This variable is used in the ``conf/layer.conf`` file and must be
+      suffixed with a `_` followed by the name of the specific layer (e.g.
+      ``BBFILE_PRIORITY_emenlow``). Colon as separator is not supported.
+
       This variable is useful in situations where the same recipe appears
       in more than one layer. Setting this variable allows you to
       prioritize a layer against other layers that contain the same recipe
@@ -771,7 +772,7 @@ overview of their function and contents.
       higher precedence. For example, the value 6 has a higher precedence
       than the value 5. If not specified, the :term:`BBFILE_PRIORITY` variable
       is set based on layer dependencies (see the :term:`LAYERDEPENDS` variable
-      for more information. The default priority, if unspecified for a
+      for more information). The default priority, if unspecified for a
       layer with no dependencies, is the lowest defined priority + 1 (or 1
       if no priorities are defined).
 
